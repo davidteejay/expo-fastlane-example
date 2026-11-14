@@ -8,9 +8,13 @@
     "scheme": "expofastlaneexample",
     "userInterfaceStyle": "automatic",
     "ios": {
-      "icon": "./assets/expo.icon"
+      "icon": "./assets/expo.icon",
+      "bundleIdentifier": "com.example.expofastlane",
+      "buildNumber": "1"
     },
     "android": {
+      "package": "com.example.expofastlane",
+      "versionCode": 1,
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/images/android-icon-foreground.png",

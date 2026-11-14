@@ -1,0 +1,146 @@
+require 'json'
+
+PROJECT_ROOT = File.expand_path('..', __dir__)
+
+def required_env(name)
+  value = ENV[name]
+  UI.user_error!("Missing #{name}; check fastlane/.env") if value.to_s.strip.empty?
+  value
+end
+
+def project_file(value)
+  path = File.expand_path(value, PROJECT_ROOT)
+  UI.user_error!("File not found: #{path}") unless File.file?(path)
+  path
+end
+
+private_lane :read_expo_config do
+  Dir.chdir(PROJECT_ROOT) do
+    JSON.parse(sh('yarn', 'expo', 'config', '--type', 'public', '--json', log: false))
+  end
+end
+
+private_lane :prepare_native do |options|
+  UI.user_error!('Set ACTIVE_ENV=prod') unless required_env('ACTIVE_ENV') == 'prod'
+
+  Dir.chdir(PROJECT_ROOT) do
+    sh('yarn', 'expo', 'prebuild', '--clean', '--platform', options[:platform], '--no-install')
+  end
+end
+
+platform :ios do
+  private_lane :apple_api_key do
+    app_store_connect_api_key(
+      key_id: required_env('IOS_API_KEY_ID'),
+      issuer_id: required_env('IOS_API_KEY_ISSUER_ID'),
+      key_filepath: project_file(required_env('IOS_API_KEY_PATH'))
+    )
+  end
+
+  desc 'Create or renew App Store signing assets (intentional write access)'
+  lane :certificates do
+    identifier = read_expo_config.fetch('ios').fetch('bundleIdentifier')
+    match(api_key: apple_api_key, app_identifier: [identifier], type: 'appstore', readonly: false)
+  end
+
+  desc 'Generate iOS, sync existing signing assets and build a signed IPA'
+  lane :build do
+    api_key = apple_api_key
+    identifier = read_expo_config.fetch('ios').fetch('bundleIdentifier')
+    match(api_key: api_key, app_identifier: [identifier], type: 'appstore', readonly: true)
+    prepare_native(platform: 'ios')
+    cocoapods(podfile: File.join(PROJECT_ROOT, 'ios', 'Podfile'))
+
+    update_code_signing_settings(
+      use_automatic_signing: false,
+      path: File.join(PROJECT_ROOT, 'ios', 'ExpoFastlaneExample.xcodeproj'),
+      team_id: required_env('APPLE_TEAM_ID'),
+      code_sign_identity: 'Apple Distribution',
+      profile_name: "match AppStore #{identifier}",
+      bundle_identifier: identifier,
+      targets: ['ExpoFastlaneExample'],
+      build_configurations: ['Release']
+    )
+
+    build_app(
+      workspace: File.join(PROJECT_ROOT, 'ios', 'ExpoFastlaneExample.xcworkspace'),
+      scheme: 'ExpoFastlaneExample',
+      configuration: 'Release',
+      clean: true,
+      export_method: 'app-store',
+      output_directory: File.join(PROJECT_ROOT, 'build', 'ios'),
+      output_name: 'ExpoFastlaneExample.ipa',
+      export_options: {
+        signingStyle: 'manual',
+        teamID: required_env('APPLE_TEAM_ID'),
+        provisioningProfiles: {
+          identifier => "match AppStore #{identifier}"
+        }
+      }
+    )
+  end
+
+  desc 'Build and upload to TestFlight; does not publish to the App Store'
+  lane :beta do
+    build
+    upload_to_testflight(
+      api_key: apple_api_key,
+      ipa: lane_context[SharedValues::IPA_OUTPUT_PATH],
+      skip_waiting_for_build_processing: true
+    )
+  end
+
+  desc 'Build and upload an App Store binary without submitting for review'
+  lane :store do
+    build
+    upload_to_app_store(
+      api_key: apple_api_key,
+      app_identifier: read_expo_config.fetch('ios').fetch('bundleIdentifier'),
+      ipa: lane_context[SharedValues::IPA_OUTPUT_PATH],
+      skip_metadata: true,
+      skip_screenshots: true,
+      submit_for_review: false,
+      automatic_release: false,
+      run_precheck_before_submit: false
+    )
+  end
+end
+
+platform :android do
+  desc 'Generate Android and build an upload-key-signed release AAB'
+  lane :build do
+    keystore = project_file(required_env('ANDROID_KEYSTORE_PATH'))
+    signing = {
+      'android.injected.signing.store.file' => keystore,
+      'android.injected.signing.store.password' => required_env('ANDROID_KEYSTORE_PASSWORD'),
+      'android.injected.signing.key.alias' => required_env('ANDROID_KEY_ALIAS'),
+      'android.injected.signing.key.password' => required_env('ANDROID_KEY_PASSWORD')
+    }
+    prepare_native(platform: 'android')
+    gradle(
+      task: 'bundle',
+      build_type: 'Release',
+      project_dir: File.join(PROJECT_ROOT, 'android'),
+      properties: signing,
+      print_command: false,
+      print_command_output: false
+    )
+  end
+
+  desc 'Build and upload a draft release to the Google Play internal track'
+  lane :beta do
+    json_key = project_file(required_env('PLAY_JSON_KEY_PATH'))
+    build
+    upload_to_play_store(
+      package_name: read_expo_config.fetch('android').fetch('package'),
+      json_key: json_key,
+      aab: lane_context[SharedValues::GRADLE_AAB_OUTPUT_PATH],
+      track: 'internal',
+      release_status: 'draft',
+      skip_upload_metadata: true,
+      skip_upload_images: true,
+      skip_upload_screenshots: true,
+      skip_upload_changelogs: true
+    )
+  end
+end
